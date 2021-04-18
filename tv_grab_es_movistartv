@@ -406,10 +406,15 @@ class Cache:
         data = self.__load('epg.json')
         if not data:
             logger.debug('Caché: EPG no encontrada')
+        self.__save(f'{time_start}-cached_epg.json', data)
         return data
 
     def save_epg(self, data):
         self.__save('epg.json', data)
+        self.__save(f'{time_start}-epg.json', data)
+
+    def save_epg_new(self, data):
+        self.__save(f'{time_start}-new_epg.json', data)
 
 
 class MovistarTV:
@@ -819,6 +824,7 @@ class MulticastIPTV:
         else:
             self.__get_bin_epg()
         new_epg = self.__drop_encrypted_channels(self.__parse_bin_epg())
+        cache.save_epg_new(new_epg)
 
         if not cached_epg:
             logger.info('Sin caché de EPG guardada')
@@ -857,6 +863,7 @@ class MulticastIPTV:
                 prev_end = cached_epg[channel][timestamp]['end']
             if not stales:
                 continue
+            # logger.info(f'[{channel}] Eventos rotos: {repr(stales)}')
             for timestamp in stales:
                 del(cached_epg[channel][timestamp])
             new_nr_entries = len(cached_epg[channel])
