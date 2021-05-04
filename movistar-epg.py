@@ -3,6 +3,7 @@
 import json
 import os
 import re
+import time
 
 from sanic import Sanic, response
 from sanic.compat import open_async
@@ -27,7 +28,7 @@ app.config.update({'KEEP_ALIVE_TIMEOUT': YEAR_SECONDS})
 
 _channels = {}
 _epgdata = {}
-_t_epg = None
+_t_epg1 = _t_epg2 = None
 
 
 @app.get('/channel_address/<channel_id>/')
@@ -193,8 +194,17 @@ async def handle_reload_epg_task():
     return response.json({'status': 'EPG Parsed'}, 200)
 
 
+async def delay_update_epg():
+    global _t_epg2
+    delay = 3600 - (time.localtime().tm_min * 60 + time.localtime().tm_sec)
+    log.info(f'Waiting for {delay}s to start updating EPG...')
+    await asyncio.sleep(delay)
+    _t_epg2 = asyncio.create_task(run_every(3600, handle_update_epg))
+
+
 async def handle_update_epg():
     log.info(f'handle_update_epg')
+    await asyncio.create_subprocess_exec('pkill', '-f', 'tv_grab_es_movistartv')
     for i in range(5):
         tvgrab = await asyncio.create_subprocess_exec(f'{PREFIX}tv_grab_es_movistartv',
                                                       '--tvheadend',
@@ -212,19 +222,19 @@ async def handle_update_epg():
 
 @app.listener('after_server_start')
 async def notify_server_start(app, loop):
-    global PREFIX, _t_epg, _t_timers
+    global PREFIX, _t_epg1
     if __file__.startswith('/app/'):
         PREFIX = '/app/'
 
     await handle_reload_epg_task()
-    await asyncio.create_subprocess_exec('pkill', '-f', 'tv_grab_es_movistartv')
-    _t_epg = asyncio.create_task(run_every(3600, handle_update_epg))
+    _t_epg1 = asyncio.create_task(delay_update_epg())
 
 
 @app.listener('after_server_stop')
 async def notify_server_stop(app, loop):
-    if _t_epg:
-        _t_epg.cancel()
+    for task in [_t_epg2, _t_epg1]:
+        if task:
+            task.cancel()
 
 
 async def run_every(timeout, stuff):
