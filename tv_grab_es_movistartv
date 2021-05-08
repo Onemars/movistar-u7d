@@ -46,7 +46,7 @@ EPG_CHANNELS = ['1', '2', '3', '4','5', '6', '477', '578', '582', '597', '657',
                 '663', '717', '743', '744', '745', '844', '884', '934', '935',
                 '1221', '2843', '2863', '3184', '3186', '3325', '3443', '3603', '4911']
 LAN_IP = os.getenv('LAN_IP', socket.gethostbyname(socket.gethostname()))
-SANIC_PORT = int(os.getenv('SANICl_PORT', '8888'))
+SANIC_PORT = int(os.getenv('SANIC_PORT', '8888'))
 sanic = f'{LAN_IP}:{SANIC_PORT}'
 
 
@@ -818,6 +818,21 @@ class MulticastIPTV:
             self.__get_bin_epg()
         new_epg = self.__drop_encrypted_channels(self.__parse_bin_epg())
 
+        fixed = 0
+        logger.info('Comprobando si el nuevo EPG necesita arreglos...')
+        for channel in new_epg:
+            sorted_new_epg = sorted(new_epg[channel])
+            for i in range(len(sorted_new_epg) - 1):
+                _end = new_epg[channel][sorted_new_epg[i]]['end']
+                _next = new_epg[channel][sorted_new_epg[i + 1]]['start'] 
+                if _end > _next:
+                    logger.error(f'{channel} {sorted_new_epg[i]} end={_end} >> next={_next}')
+                    new_epg[channel][sorted_new_epg[i]]['end'] = _next
+                    fixed += 1
+        if fixed:
+            logger.error(f'NUEVO EPG CONTENíA ERRORES DE PROGRAMAS QUE SE PISABAN')
+            logger.error(f'{fixed} programas acababan después de que el siguiente empezara')
+
         if not cached_epg:
             logger.info('Sin caché de EPG guardada')
             return new_epg
@@ -906,7 +921,8 @@ class MulticastIPTV:
 
     @staticmethod
     def __decode_string(string):
-        return (''.join(chr(char ^ 0x15) for char in string)).encode('latin1').decode()
+        _t = (''.join(chr(char ^ 0x15) for char in string)).encode('latin1').decode()
+        return _t.replace('&quot;', '«', 1).replace('&quot;', '»', 1)
 
     @staticmethod
     def __parse_bin_epg_header(data):
@@ -922,35 +938,56 @@ class MulticastIPTV:
             }
         except Exception as ex:
             logger.error('Error al procesar la cabecera: %s' % repr(ex))
+            raise
 
     @staticmethod
     def __sanitize(text):
         try:
-            return unescape(text).replace('\n', ' ').replace('\r', ' ').replace('/', ' ')
+            _t = unescape(text).replace('\n', ' ').replace('\r', ' ')
+            return _t.replace(' / ', ': ').replace('/', '')
         except TypeError:
-            return text.replace('\n', ' ').replace('\r', ' ').replace('/', ' ')
+            _t = text.replace('\n', ' ').replace('\r', ' ')
+            return _t.replace(' / ', ': ').replace('/', '')
 
     def __parse_bin_epg_body(self, data):
         epg_dt = data[:-4]
         try:
             programs = {}
             while epg_dt:
+                is_serie = False
+                episode_title = serie = ''
                 start = struct.unpack('>I', epg_dt[4:8])[0]
                 duration = struct.unpack('>H', epg_dt[8:10])[0]
                 title_end = struct.unpack('B', epg_dt[31:32])[0] + 32
                 episode = struct.unpack('B', epg_dt[title_end + 8:title_end + 9])[0]
-                full_title = self.__sanitize(self.__decode_string(epg_dt[32:title_end]))
-                serie = re.findall(r'(.*)(:\s|\sT\d*|Episo)/?\d*.*', full_title, re.U)
                 season = struct.unpack('B', epg_dt[title_end + 11:title_end + 12])[0]
-                is_serie = bool(episode)
-                if serie and serie[0][0]:
-                    is_serie = True
-                    serie = serie[0][0]
-                elif is_serie:
-                    serie = full_title
+                full_title = self.__sanitize(self.__decode_string(epg_dt[32:title_end]))
+                serie_id = struct.unpack('>H', epg_dt[title_end + 5:title_end + 7])[0]
+                if re.match(r".+ T\d+ .+", full_title):
+                    x = re.search(r"(.+(?!T\d)) +T([ \d]+)(?: *Ep?.? *(\d+))?[ -]*(.*)",
+                                  full_title)
                 else:
-                    serie = ''
-                pr_title_end = None
+                    x = re.search(r"(.+(?!T\d))(?: +T([ \d]+))? *Ep?.? *(\d+)[ -]*(.*)",
+                                  full_title)
+                if x := x and x.groups():
+                    is_serie = True
+                    serie = x[0].strip() if x[0] else \
+                        full_title.split('-')[0].strip() if '-' in full_title else full_title
+                    season = int(x[1]) if x[1] else season
+                    episode = int(x[2]) if x[2] else episode
+                    episode_title = \
+                        x[3].strip().replace('- ',
+                                             '-').replace(' -','-').replace('-',' - ')
+                    if serie and season and episode:
+                        full_title = '%s S%02dE%02d' % (serie, season, episode)
+                        if episode_title:
+                            full_title += ' - %s' % episode_title
+                elif serie_id:
+                    is_serie = True
+                    if ' - ' in full_title:
+                        serie, episode_title = full_title.split(' - ', 1)
+                    else:
+                        serie = full_title
                 programs[start] = {
                     'pid': struct.unpack('>I', epg_dt[:4])[0],
                     'start': start,
@@ -959,8 +996,7 @@ class MulticastIPTV:
                     'genre': '{:02X}'.format(struct.unpack('B', epg_dt[20:21])[0]),
                     'age_rating': struct.unpack('B', epg_dt[24:25])[0],
                     'full_title': full_title,
-                    'serie_id':
-                        struct.unpack('>H', epg_dt[title_end + 5:title_end + 7])[0],
+                    'serie_id': serie_id,
                     'episode': episode,
                     'year':
                         str(struct.unpack('>H', epg_dt[title_end + 9:title_end + 11])[0]),
@@ -968,24 +1004,18 @@ class MulticastIPTV:
                     'season': season,
                     'is_serie': is_serie
                 }
-                if is_serie and not season:
-                    sn = re.findall(r'.*\sT(\d*/?\d+).*',
-                                    programs[start]['full_title'], re.U)
-                    if sn:
-                        programs[start]['season'] = int(sn[0].replace('/', ''))
-                pr_title = programs[start]['full_title'].split(' - ')
+                if episode_title:
+                    programs[start]['episode_title'] = episode_title
                 pr_title_end = \
-                    struct.unpack('B',
-                                  epg_dt[title_end + 12:title_end + 13])[0] \
-                    + title_end + 13
-                if len(pr_title) == 2:
-                    programs[start]['episode_title'] = self.__sanitize(pr_title[1])
+                    struct.unpack('B', epg_dt[title_end + 12:title_end + 13])[0] \
+                        + title_end + 13
                 cut = pr_title_end if pr_title_end else title_end
                 epg_dt \
                     = epg_dt[struct.unpack('B', epg_dt[cut + 3:cut + 4])[0] + cut + 4:]
             return programs
         except Exception as ex:
             logger.error('Error al procesar la guía: %s' % repr(ex))
+            raise
 
     def __merge_dicts(self, dict1, dict2, path=None):
         path = [] if path is None else path
@@ -1080,17 +1110,11 @@ class XMLTV:
     def __get_series_data(program, ext_info):
         episode = program['episode']
         season = program['season']
-        if 'episode_title' in program:
-            stitle = '%ix%02d %s' % (season, episode, program['episode_title'])
-        else:
-            stitle = '%ix%02d %s' % (
-                season, episode, ext_info['originalTitle']
-                if ext_info and 'originalTitle' in ext_info else 'Episodio %i' % episode
-            )
+        stitle = program['episode_title'] if 'episode_title' in program else ''
         return {
-            'title': program['serie'] if 'serie' in program else program['full_title'],
-            'sub-title': stitle,
-            'season': season if season > 0 else '',
+            'title': program['serie'] if program['serie'] else program['full_title'],
+            'sub-title': stitle if not stitle.startswith('Episod') else '',
+            'season': season,
             'episode': episode
         }
 
@@ -1105,9 +1129,14 @@ class XMLTV:
         tag_title.text = program['full_title']
         tag_desc = ElTr.SubElement(tag_programme, 'desc', lang['es'])
         tag_desc.text = 'Año: ' + program['year'] + '. '
+        ext_info = mtv.get_epg_extended_info(program['pid'], channel_id)
+        orig_title = ext_info['originalTitle'] \
+            if ext_info and 'originalTitle' in ext_info else None
+        if orig_title and \
+            orig_title not in program['full_title'] and not orig_title.startswith('Episod'):
+            tag_desc.text +=  f'«{orig_title}» ' 
         gens = self.__get_genre_and_subgenre(program['genre'])
         keys = self.__get_key_and_subkey(program['genre'], config['genres'])
-        ext_info = mtv.get_epg_extended_info(program['pid'], channel_id)
         # Series
         if program['serie_id'] > 0:
             tsse = self.__get_series_data(program, ext_info)
@@ -1119,15 +1148,14 @@ class XMLTV:
             tag_episode_num = ElTr.SubElement(tag_programme,
                                               'episode-num',
                                               {'system': 'xmltv_ns'})
-            tag_episode_num.text = '%s.%i.' % (
-                '%i' % (tsse['season'] - 1)
-                if tsse['season'] else '', tsse['episode'] - 1)
+            tag_episode_num.text = str(int(tsse['season']) - 1 if tsse['season'] else '') \
+                 + '.' + str(int(tsse['episode']) - 1 if tsse['episode'] else '')
         # Películas y otros
         elif ext_info:
-            if 'Movie' in gens['genre'] and 'productionDate' in ext_info:
-                tag_stitle = ElTr.SubElement(tag_programme, 'sub-title', lang['es'])
-                tag_stitle.text = str(ext_info['productionDate'])
             if 'productionDate' in ext_info:
+                if 'Movie' in gens['genre']:
+                    tag_stitle = ElTr.SubElement(tag_programme, 'sub-title', lang['es'])
+                    tag_stitle.text = str(ext_info['productionDate'])
                 tag_date = ElTr.SubElement(tag_programme, 'date')
                 tag_date.text = str(ext_info['productionDate'])
                 tag_desc.text = 'Año: ' + tag_date.text + '. '

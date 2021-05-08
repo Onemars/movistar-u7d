@@ -16,13 +16,14 @@ from collections import namedtuple
 
 SANIC_EPG_HOST = os.getenv('SANIC_EPG_HOST', '127.0.0.1')
 SANIC_EPG_PORT = int(os.getenv('SANIC_EPG_PORT', '8889'))
-STORAGE = os.getenv('U7D_DIR', '/tmp')
+RECORDINGS = os.getenv('RECORDINGS', '/tmp')
 
 MVTV_URL = 'http://www-60.svc.imagenio.telefonica.net:2001/appserver/mvtv.do'
 SANIC_EPG_URL = f'http://{SANIC_EPG_HOST}:{SANIC_EPG_PORT}'
 Request = namedtuple('Request', ['request', 'response'])
 Response = namedtuple('Response', ['version', 'status', 'url', 'headers', 'body'])
-VID_EXT = '.mp4'
+TMP_EXT = '._mp4'
+VID_EXT = '.mkv'
 UA = 'MICA-IP-STB'
 # WIDTH = 134
 
@@ -124,9 +125,8 @@ def find_free_port():
 
 
 def safe_filename(filename):
-    keepcharacters = (' ', '.', '_')
-    return "".join(c for c in filename.replace('/', '_')
-                   if c.isalnum() or c in keepcharacters).rstrip()
+    keepcharacters = (' ', ',', '.', '_', '-', ':', '¡', '!', '¿', '?')
+    return "".join(c for c in filename if c.isalnum() or c in keepcharacters).rstrip()
 
 
 def main(args):
@@ -198,23 +198,26 @@ def main(args):
                         args.time = int(data['duration']) - args.start
                     title = safe_filename(data['full_title'])
                     if data['is_serie']:
-                        path = os.path.join(STORAGE, safe_filename(data['serie']))
-                        filename = os.path.join(path, title + VID_EXT)
+                        path = os.path.join(RECORDINGS, safe_filename(data['serie']))
+                        filename = os.path.join(path, title)
                         if not os.path.exists(path):
                             print(f'Creating recording subdir {path}', flush=True)
                             os.mkdir(path)
                     else:
-                        filename = os.path.join(STORAGE, title + VID_EXT)
+                        filename = os.path.join(RECORDINGS, title)
                 elif args.time:
-                    filename = os.path.join(STORAGE,
-                                            f'{args.channel}-{args.broadcast}{VID_EXT}')
+                    filename = os.path.join(RECORDINGS,
+                                            f'{args.channel}-{args.broadcast}')
                 else:
                     raise ValueError('Recording time unknown')
 
-                command = ['socat']
-                command.append('-u')
-                command.append(f'UDP4-LISTEN:{args.client_port}')
-                command.append(f'OPEN:"{filename}",creat,trunc')
+                host = socket.gethostbyname(socket.gethostname())
+                command = ['ffmpeg', '-i']
+                command += [f'udp://@{host}:{args.client_port}?fifo_size=278873"']
+                command += ['-map', '0', '-y', '-c', 'copy']
+                command += ['-c:a:0', 'aac', '-c:a:1', 'aac']
+                command += ['-movflags', '+faststart', '-v', 'panic']
+                command += ['-f', 'matroska', '-t', f'{args.time}', f'{filename}{TMP_EXT}']
 
                 proc = multiprocessing.Process(target=subprocess.call, args=(command, ))
                 proc.start()
@@ -235,24 +238,35 @@ def main(args):
 
             while True:
                 time.sleep(30)
+                if args.write_to_file and proc and not proc.is_alive():
+                    break
                 client.print(client.send_request('GET_PARAMETER', get_parameter))
 
         except KeyboardInterrupt:
             pass
         except Exception as ex:
-            if args.write_to_file and proc and proc.is_alive():
-                proc.terminate()
-                if proc.is_alive():
-                    subprocess.call(['pkill', '-f', f"{' '.join(command[:3])}"])
             print(f"{'[' + args.client_ip + '] ' if args.client_ip else ''}"
                   f"{'Finished:' if isinstance(ex, TimeoutError) else repr(ex)} "
                   f'{args.channel}',
                   f'{args.broadcast}',
                   f'[{args.time}s]',
-                  f'"{filename}"' if args.write_to_file and filename else '', flush=True)
+                  f'"{filename}"' if (args.write_to_file and filename) else '', flush=True)
         finally:
             if client and 'Session' in session:
                 client.print(client.send_request('TEARDOWN', session), killed=args)
+            if args.write_to_file:
+                if proc and proc.is_alive():
+                    for i in range(2):
+                        subprocess.call(['pkill', '-f', f'ffmpeg.+udp://.+{args.client_port}'])
+                if filename:
+                    command = ['mkvmerge', '-o', f'{filename}{VID_EXT}']
+                    command += ['--default-language', 'spa']
+                    command += ['--language', '1:spa', '--language', '2:eng']
+                    command += ['--language', '3:spa', '--language', '4:eng']
+                    command += ['--language', '5:spa', '--language', '6:eng']
+                    command += [f'{filename}{TMP_EXT}']
+                    subprocess.call(command)
+                    os.remove(f'{filename}{TMP_EXT}')
 
 
 if __name__ == '__main__':
@@ -277,5 +291,4 @@ if __name__ == '__main__':
               f'{args.channel}',
               f'{args.broadcast}',
               f'-s {args.start}',
-              '-p {args.client_port}',
-              f'"{filename}"' if args.write_to_file and filename else '', flush=True)
+              '-p {args.client_port}', flush=True)
